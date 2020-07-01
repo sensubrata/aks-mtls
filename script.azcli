@@ -10,7 +10,7 @@ openssl rsa -in $sslCertFolder/finomial-ssl-2021.key -out $sslCertFolder/finomia
 # Extract public key
 openssl pkcs12 -in $pfxFilePath/finomial-ssl-2021.pfx -clcerts -nokeys -out $sslCertFolder/finomial-ssl-2021.crt
 # copy CA bundle (downloaded from from Digicert site)
-cp $pfxFilePath/wildcard_finomial_com-bundle.crt $sslCertFolder
+cp $pfxFilePath/wildcard_finomial_com-bundle.crt $sslCertFolder  # later not used in ingress
 
 ## Generate self-signed cert
 selfCertFolder='self-certs'
@@ -35,6 +35,7 @@ vnetName='TestVnetmsdn'
 subnetName='BackEnd'
 poolName='newnetpool3'  # max 12 char
 k8Version='1.14.8'
+vmSize='Standard_A2'
 # select subscription
 az account set --subscription $subscription
 # get subnet id
@@ -46,7 +47,7 @@ az aks nodepool add \
     --name $poolName \
     --node-count 1 \
     --vnet-subnet-id $subnetId \
-    --node-vm-size Standard_A2 \
+    --node-vm-size $vmSize \
     --node-taints usage=publicAPI:NoSchedule \
     --labels usage=publicAPI \
     --kubernetes-version $k8Version \
@@ -60,10 +61,11 @@ k8ymlFolder='k8ymls'
 # get the resource group name of the AKS cluster
 clusterRG=$(az aks show --resource-group $aksRG --name $aksName --query nodeResourceGroup -o tsv)
 # Create static IP
-az network public-ip create --resource-group $clusterRG --name $pipName \
+pipIP=$(az network public-ip create --resource-group $clusterRG --name $pipName \
   --sku Standard --allocation-method static --dns-name "$pipDNSname" \
-  --query publicIp.ipAddress -o tsv   #test-output:13.83.98.84
+  --query publicIp.ipAddress -o tsv)
   #--tags "env=$environment" "type=pip"
+echo $pipIP   #test-output:13.83.98.84
 # Configure NginX for SSL and mTLS
 # select aks-cluster
 kubectx $aksName
@@ -75,7 +77,7 @@ helm install --name nginx-ingress-api stable/nginx-ingress \
     --set controller.replicaCount=2 \
     --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
     --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux \
-    --set controller.service.loadBalancerIP="13.83.98.84" \
+    --set controller.service.loadBalancerIP="$pipIP" \
     --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-dns-label-name"="$pipDNSname"
 # create test containers in the tainted node  
 kubectl apply -f $k8ymlFolder/aks-helloworld.yaml #--namespace ingress-api
