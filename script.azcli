@@ -1,0 +1,96 @@
+### This script creates an additional nodepool for public api hosting
+
+## Get Private key from finomial.com ssl pfx (Downloaded from Key Vault)
+# Get paths
+sslCertFolder='finssl-certs'
+pfxFilePath='/mnt/c/Users/SubrataSen/Documents'
+# Extract private key (it will promt for password)
+openssl pkcs12 -in $pfxFilePath/finomial-ssl-2021.pfx -nocerts -out $sslCertFolder/finomial-ssl-2021.key
+openssl rsa -in $sslCertFolder/finomial-ssl-2021.key -out $sslCertFolder/finomial-ssl-2021.key
+# Extract public key
+openssl pkcs12 -in $pfxFilePath/finomial-ssl-2021.pfx -clcerts -nokeys -out $sslCertFolder/finomial-ssl-2021.crt
+# copy CA bundle (downloaded from from Digicert site)
+cp $pfxFilePath/wildcard_finomial_com-bundle.crt $sslCertFolder
+
+## Generate self-signed cert
+selfCertFolder='self-certs'
+cd $selfCertFolder
+# Generate the CA Key and Certificate
+openssl req -x509 -sha256 -newkey rsa:4096 -keyout ca.key -out ca.crt -days 356 -nodes -subj '/CN=Finomial Cert Authority'
+# Generate the Server Key, and Certificate and Sign with the CA Certificate
+openssl req -new -newkey rsa:4096 -keyout server.key -out server.csr -nodes -subj '/CN=finomialapi-test.finomial.com'
+openssl x509 -req -sha256 -days 365 -in server.csr -CA ca.crt -CAkey ca.key -set_serial 01 -out server.crt
+# Generate the Client Key, and Certificate and Sign with the CA Certificate
+openssl req -new -newkey rsa:4096 -keyout client.key -out client.csr -nodes -subj '/CN=finomialapiClient'
+openssl x509 -req -sha256 -days 365 -in client.csr -CA ca.crt -CAkey ca.key -set_serial 02 -out client.crt
+# go to scriptpath
+cd ..
+
+## Create nodepool
+# params
+subscription='0e0a76e9-845f-42fb-bf7c-66ba40a4a97f'
+aksRG="kubetest"
+aksName="vpa-test"
+vnetName='TestVnetmsdn'
+subnetName='BackEnd'
+poolName='newnetpool3'  # max 12 char
+k8Version='1.14.8'
+# select subscription
+az account set --subscription $subscription
+# get subnet id
+subnetId=$(az network vnet subnet show --resource-group $vnetrgname --vnet-name $vnetName --name $subnetName --query id -o tsv)
+# add tainted nodepool with custom size and dediacated subnet
+az aks nodepool add \
+    --resource-group $aksRG \
+    --cluster-name $aksName \
+    --name $poolName \
+    --node-count 1 \
+    --vnet-subnet-id $subnetId \
+    --node-vm-size Standard_A2 \
+    --node-taints usage=publicAPI:NoSchedule \
+    --labels usage=publicAPI \
+    --kubernetes-version $k8Version \
+    --no-wait
+
+## Deploy Ingress (with optional test containers)
+#params
+pipDNSname='finomialapi-test'
+pipName='vpatestpip'
+k8ymlFolder='k8ymls'
+# get the resource group name of the AKS cluster
+clusterRG=$(az aks show --resource-group $aksRG --name $aksName --query nodeResourceGroup -o tsv)
+# Create static IP
+az network public-ip create --resource-group $clusterRG --name $pipName \
+  --sku Standard --allocation-method static --dns-name "$pipDNSname" \
+  --query publicIp.ipAddress -o tsv   #test-output:13.83.98.84
+  #--tags "env=$environment" "type=pip"
+# Configure NginX for SSL and mTLS
+# select aks-cluster
+kubectx $aksName
+# Create a namespace for your ingress resources
+ #kubectl create namespace ingress-api
+# Use Helm to deploy an NGINX ingress controller
+helm install --name nginx-ingress-api stable/nginx-ingress \
+    --namespace default \
+    --set controller.replicaCount=2 \
+    --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
+    --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux \
+    --set controller.service.loadBalancerIP="13.83.98.84" \
+    --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-dns-label-name"="$pipDNSname"
+# create test containers in the tainted node  
+kubectl apply -f $k8ymlFolder/aks-helloworld.yaml #--namespace ingress-api
+kubectl apply -f $k8ymlFolder/ingress-demo.yaml #--namespace ingress-api
+# create secrets for ssl and mtls certificates
+kubectl create secret tls ingress-ssl \
+    --namespace default \
+    --key $sslCertFolder/finomial-ssl-2021.key \
+    --cert $sslCertFolder/finomial-ssl-2021.crt 
+cd $selfCertFolder    
+kubectl create secret generic ingress-mtls \
+    --namespace default \
+    --from-file=tls.crt=server.crt \
+    --from-file=tls.key=server.key \
+    --from-file=ca.crt=ca.crt
+cd ..    
+# create ingress object
+kubectl apply -f $k8ymlFolder/api-test-ingress.yaml
